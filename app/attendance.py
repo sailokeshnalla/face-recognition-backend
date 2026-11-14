@@ -2,6 +2,7 @@
 
 import os
 import ssl
+import time
 import hmac
 import uuid
 import smtplib
@@ -111,6 +112,58 @@ def send_attendance_email(
         server.send_message(message)
 
 
+def dedupe_clause() -> tuple[str, dict]:
+    """SQL fragment that finds a check-in that already counts for today.
+
+    ATTENDANCE_DEDUPE=window        (default) a check-in within the last
+                                    ATTENDANCE_WINDOW_HOURS hours (default 12)
+    ATTENDANCE_DEDUPE=calendar_day  a check-in since midnight India time
+    The fragment is built only from constants, never from request data.
+    """
+    mode = os.getenv("ATTENDANCE_DEDUPE", "window").strip().lower()
+
+    if mode == "calendar_day":
+        return (
+            "verified_at >= (date_trunc('day', now() AT TIME ZONE "
+            "'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata')",
+            {}
+        )
+
+    try:
+        hours = int(os.getenv("ATTENDANCE_WINDOW_HOURS", "12"))
+    except ValueError:
+        hours = 12
+
+    if not 1 <= hours <= 72:
+        hours = 12
+
+    return "verified_at > now() - make_interval(hours => :hours)", {"hours": hours}
+
+
+EMAIL_RETRY_DELAYS = (0, 2, 5)   # seconds before attempt 1, 2 and 3
+
+
+def send_with_retry(employee, checked_in_at, verification_method):
+    """Try the email up to three times. Returns (sent, error_name)."""
+    last_error = None
+
+    for attempt, delay in enumerate(EMAIL_RETRY_DELAYS, start=1):
+        if delay:
+            time.sleep(delay)
+
+        try:
+            send_attendance_email(employee, checked_in_at, verification_method)
+            return True, None
+        except Exception as exc:
+            last_error = type(exc).__name__
+            logger.warning(
+                "Attendance email attempt %d/%d failed (%s)",
+                attempt, len(EMAIL_RETRY_DELAYS), last_error
+            )
+
+    return False, last_error
+
+
 def record_check_in(employee_code: str, verification_method: str) -> dict:
     """Shared core for manual and face-recognition check-ins.
 
@@ -161,17 +214,19 @@ def record_check_in(employee_code: str, verification_method: str) -> dict:
                 )
 
             # Prevent duplicate attendance records and duplicate emails.
+            dedupe_sql, dedupe_params = dedupe_clause()
+
             existing = conn.execute(
-                text("""
+                text(f"""
                     SELECT id
                     FROM public.attendance_events
                     WHERE employee_id = :employee_id
                       AND event_type = 'check_in'
-                      AND verified_at > now() - interval '12 hours'
+                      AND {dedupe_sql}
                     ORDER BY verified_at DESC
                     LIMIT 1
                 """),
-                {"employee_id": employee["id"]}
+                {"employee_id": employee["id"], **dedupe_params}
             ).scalar_one_or_none()
 
             if existing:
@@ -179,7 +234,7 @@ def record_check_in(employee_code: str, verification_method: str) -> dict:
                     "status": "already_checked_in",
                     "attendance_id": str(existing),
                     "email_sent": False,
-                    "message": "Recent check-in already exists"
+                    "message": "Check-in already recorded for this period"
                 }
 
             conn.execute(
@@ -254,13 +309,9 @@ def record_check_in(employee_code: str, verification_method: str) -> dict:
     # The attendance record has been committed.
     # Email delivery is handled separately.
 
-    email_sent = False
-
-    try:
-        send_attendance_email(employee, now, verification_method)
-        email_sent = True
-    except Exception:
-        logger.exception("Attendance email delivery failed")
+    email_sent, email_error = send_with_retry(
+        employee, now, verification_method
+    )
 
     try:
         with engine.begin() as conn:
@@ -281,7 +332,9 @@ def record_check_in(employee_code: str, verification_method: str) -> dict:
                     ),
                     "error_message": (
                         None if email_sent
-                        else "SMTP delivery attempt failed"
+                        else f"SMTP failed after "
+                             f"{len(EMAIL_RETRY_DELAYS)} attempts "
+                             f"({email_error})"
                     )
                 }
             )
@@ -361,3 +414,104 @@ def recognized_check_in(
     )
 
     return record_check_in(request.employee_code, "face_recognition")
+
+
+@router.post("/retry-failed-emails")
+def retry_failed_emails(
+    limit: int = 20,
+    x_demo_token: str | None = Header(default=None)
+):
+    """Re-send check-in emails whose delivery failed earlier."""
+    verify_token(x_demo_token)
+
+    limit = max(1, min(limit, 50))
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT n.id AS notification_id,
+                           n.recipient_email,
+                           e.employee_code,
+                           e.full_name,
+                           a.verified_at,
+                           a.verification_method
+                    FROM public.notifications n
+                    JOIN public.employees e
+                      ON e.id = n.employee_id
+                    JOIN public.attendance_events a
+                      ON a.id = n.attendance_event_id
+                    WHERE n.status = 'failed'
+                      AND n.notification_type = 'check_in_confirmation'
+                    ORDER BY n.created_at
+                    LIMIT :limit
+                """),
+                {"limit": limit}
+            ).mappings().all()
+    except SQLAlchemyError:
+        logger.exception("Failed to load failed notifications")
+        raise HTTPException(503, "Unable to load failed notifications")
+
+    sent = 0
+    failed = 0
+
+    for row in rows:
+        # Claim the row so two simultaneous retries cannot both send it.
+        try:
+            with engine.begin() as conn:
+                claimed = conn.execute(
+                    text("""
+                        UPDATE public.notifications
+                        SET status = 'sending'
+                        WHERE id = :id AND status = 'failed'
+                        RETURNING id
+                    """),
+                    {"id": row["notification_id"]}
+                ).first()
+        except SQLAlchemyError:
+            logger.exception("Failed to claim notification")
+            failed += 1
+            continue
+
+        if claimed is None:
+            continue
+
+        employee = {
+            "email": row["recipient_email"],
+            "full_name": row["full_name"],
+            "employee_code": row["employee_code"]
+        }
+
+        ok, error = send_with_retry(
+            employee, row["verified_at"], row["verification_method"]
+        )
+
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("""
+                        UPDATE public.notifications
+                        SET status = :status,
+                            sent_at = :sent_at,
+                            error_message = :error_message
+                        WHERE id = :id
+                    """),
+                    {
+                        "id": row["notification_id"],
+                        "status": "sent" if ok else "failed",
+                        "sent_at": datetime.now(timezone.utc) if ok else None,
+                        "error_message": (
+                            None if ok
+                            else f"SMTP failed on retry ({error})"
+                        )
+                    }
+                )
+        except SQLAlchemyError:
+            logger.exception("Failed to update notification after retry")
+
+        if ok:
+            sent += 1
+        else:
+            failed += 1
+
+    return {"retried": sent + failed, "sent": sent, "failed": failed}
